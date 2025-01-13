@@ -8,8 +8,8 @@ from io import BytesIO
 from os import getenv
 import pathlib
 import os
-from fuzzywuzzy import process
 from flask_cors import CORS
+
 
 app = Flask(__name__)
 CORS(app)
@@ -17,7 +17,7 @@ CORS(app)
 
 # Load the dataset once when the app starts
 try:
-    dataset = pd.read_csv(r"D:\Assignment\Assignment\Capstone-Project-Final\healthmapfinderflask\Hospital inmoratlity.csv")
+    dataset = pd.read_csv(r"C:\Users\RAGHU JAMMULA\OneDrive - Saint Peters University\Desktop\Capstone Project\healthmapfinderflask\Hospital inmoratlity.csv")
     # Clean column names and handle missing values
     dataset = dataset.fillna('')  # Replace NaN with empty string
     # Ensure all required columns exist
@@ -117,34 +117,53 @@ def search_hospitals():
             (dataset['State'].str.upper() == state.upper())
         ]
 
-        if matching_hospitals.empty:
-            return jsonify([]), 200
+        # If health issue is provided, filter by relevant measures
+        if health_issue:
+            # Get hospitals that have data for the relevant condition
+            condition_hospitals = matching_hospitals[
+                matching_hospitals['Measure Name'].str.contains(health_issue, case=False, na=False)
+            ]
+            if not condition_hospitals.empty:
+                matching_hospitals = condition_hospitals
 
-        # Sort hospitals by Score (assuming higher is better)
-        matching_hospitals = matching_hospitals.sort_values('Score', ascending=False)
+        # Group by hospital to get unique entries
+        hospitals_grouped = matching_hospitals.groupby(['Provider ID', 'Hospital Name', 'Address', 'City', 'State', 'ZIP Code', 'County'])
 
-        # Prepare results
         results = []
-        for _, hospital in matching_hospitals.iterrows():
+        for _, hospital in hospitals_grouped.first().reset_index().iterrows():
+            # Calculate average score for the hospital
+            hospital_scores = matching_hospitals[
+                matching_hospitals['Provider ID'] == hospital['Provider ID']
+            ]['Score'].astype(float)
+            
+            avg_score = hospital_scores.mean() if not hospital_scores.empty else 0
+
             results.append({
-                "id": str(hospital.get("Provider ID", "")),
-                "name": str(hospital.get("Hospital Name", "")),
-                "address": str(hospital.get("Address", "")),
-                "city": str(hospital.get("City", "")),
-                "state": str(hospital.get("State", "")),
-                "zipCode": str(hospital.get("ZIP Code", "")),
-                "county": str(hospital.get("County", "")),
-                "score": float(hospital.get("Score", 0)),
-                "distance": None,  # To be implemented with geolocation
-                "specialties": [],  # To be implemented with additional data
+                "id": str(hospital['Provider ID']),
+                "name": str(hospital['Hospital Name']),
+                "address": str(hospital['Address']),
+                "city": str(hospital['City']),
+                "state": str(hospital['State']),
+                "zipCode": str(hospital['ZIP Code']),
+                "county": str(hospital['County']),
+                "score": float(avg_score),
                 "ratings": {
-                    "overall": float(hospital.get("Score", 0)) / 20,  # Convert score to 0-5 scale
-                    "quality": None,  # To be implemented with additional data
-                    "safety": None   # To be implemented with additional data
+                    "overall": min(float(avg_score) / 20, 5.0),  # Convert score to 0-5 scale
+                    "quality": None,
+                    "safety": None
+                },
+                "performanceLevel": "Average",  # Or calculate based on score
+                "description": f"Hospital in {hospital['City']}, {hospital['State']}",
+                "distance": 0,  # Calculate if you have coordinates
+                "specialties": [],  # Add if you have specialties data
+                "statistics": {
+                    "bedsCount": None,
+                    "annualAdmissions": None,
+                    "outpatientVisits": None
                 }
             })
-        print(results)
 
+        print(results)
         return jsonify(results), 200
 
     except Exception as e:
@@ -154,6 +173,7 @@ def search_hospitals():
 
 @app.route('/api/conditions/search', methods=['GET'])
 def search_conditions():
+    (request)
     if dataset.empty:
         return jsonify({"error": "Dataset not available"}), 500
 
