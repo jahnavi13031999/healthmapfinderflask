@@ -9,13 +9,15 @@ from os import getenv
 import pathlib
 import os
 from flask_cors import CORS
-from geopy.geocoders import Nominatim
-from geopy.distance import geodesic
+# from geopy.geocoders import Nominatim
+# from geopy.distance import geodesic
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
-from geopy.exc import GeocoderTimedOut, GeocoderServiceError
+# from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 from functools import lru_cache
 import time
+import math
+import numpy as np
 
 app = Flask(__name__)
 # Enable CORS with credentials support
@@ -25,8 +27,8 @@ CORS(app, resources={
             "http://localhost:8080",
             "http://localhost:3000",
             "http://localhost:5173",
-            "https://lovable.dev",
-            "https://gptengineer.app"
+            # "https://lovable.dev",
+            # "https://gptengineer.app"
         ],
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"],
@@ -44,7 +46,7 @@ def after_request(response):
 
 # Load the dataset once when the app starts
 try:
-    dataset = pd.read_csv(r"D:\Assignment\Assignment\Capstone-Project-Final\healthmapfinderflask\Hospital inmoratlity.csv")
+    dataset = pd.read_csv(r"Hospital inmoratlity.csv")
     # Clean column names and handle missing values
     dataset = dataset.fillna('')  # Replace NaN with empty string
     # Ensure all required columns exist
@@ -115,41 +117,6 @@ def calculate_hospital_score(measures: pd.DataFrame) -> Tuple[float, bool]:
         return 25.0, False
     return float(valid_scores.mean()), True
 
-# Cache for geocoding results
-@lru_cache(maxsize=1000)
-def geocode_address(address: str) -> tuple[float, float] | None:
-    try:
-        # Create a new geolocator instance with increased timeout
-        geolocator = Nominatim(
-            user_agent="healthmapfinder",
-            timeout=5
-        )
-        location = geolocator.geocode(address)
-        if location:
-            return (location.latitude, location.longitude)
-        return None
-    except (GeocoderTimedOut, GeocoderServiceError) as e:
-        print(f"Geocoding error for address {address}: {str(e)}")
-        return None
-
-def calculate_distance(hospital: pd.Series, search_coords: Optional[Tuple[float, float]]) -> float:
-    if not search_coords:
-        return 0
-    
-    try:
-        hospital_address = f"{hospital['Address']}, {hospital['City']}, {hospital['State']} {hospital['ZIP Code']}"
-        
-        # Add delay between requests to avoid rate limiting
-        time.sleep(0.1)  # 100ms delay
-        
-        hospital_coords = geocode_address(hospital_address)
-        if hospital_coords:
-            return round(geodesic(search_coords, hospital_coords).miles, 1)
-        return 0
-    except Exception as e:
-        print(f"Error calculating distance for {hospital['Hospital Name']}: {str(e)}")
-        return 0
-
 def create_hospital_dict(hospital: pd.Series, avg_score: float, has_data: bool, 
                         stats: HospitalStats, distance: float, 
                         performance: str, performance_detail: str) -> Dict:
@@ -188,6 +155,16 @@ def create_hospital_dict(hospital: pd.Series, avg_score: float, has_data: bool,
         "distance": distance,
         "specialties": []
     }
+
+def get_location_relevance(hospital: pd.Series, search_location: str) -> str:
+    """Determine if hospital is in the searched city, state, or other location"""
+    search_city, search_state = [x.strip() for x in search_location.split(',', 1)]
+    
+    if hospital['City'].strip().upper() == search_city.upper():
+        return 'city'
+    elif hospital['State'].strip().upper() == search_state.strip().upper():
+        return 'state'
+    return 'other'
 
 @app.route('/api/locations/search', methods=['GET'])
 def search_locations():
@@ -247,6 +224,10 @@ def search_locations():
 
 @app.route('/api/hospitals/search', methods=['GET'])
 def search_hospitals():
+    # Get pagination parameters
+    page = int(request.args.get('page', 1))
+    per_page = int(request.args.get('per_page', 9))  # 9 cards per page (3x3 grid)
+    
     if dataset.empty:
         return jsonify({"error": "Dataset not available"}), 500
 
@@ -257,29 +238,49 @@ def search_hospitals():
         return jsonify({"error": "Location is required"}), 400
 
     try:
+        # Initialize hospitals list
+        hospitals = []
+
         # Filter hospitals based on health issue
         matching_hospitals = dataset.copy()
         if health_issue:
-            condition_hospitals = matching_hospitals[
-                matching_hospitals['Measure Name'].str.contains(health_issue, case=False, na=False)
-            ]
+            condition_hospitals = matching_hospitals[matching_hospitals['Measure Name'].str.contains(health_issue, case=False, na=False)]
             if not condition_hospitals.empty:
                 matching_hospitals = condition_hospitals
 
-        results: List[Dict] = []
-        
-        # Group hospitals and convert to DataFrame
+        # Group hospitals
         hospitals_grouped = matching_hospitals.groupby(
             ['Provider ID', 'Hospital Name', 'Address', 'City', 'State', 'ZIP Code', 'County']
         ).first().reset_index()
             
         for _, hospital in hospitals_grouped.iterrows():
             try:
-                # Get hospital measures
-                hospital_measures = matching_hospitals[
-                    matching_hospitals['Provider ID'] == hospital['Provider ID']
-                ]
+                # Get all measures for this hospital
+                hospital_measures = matching_hospitals[matching_hospitals['Provider ID'] == hospital['Provider ID']]
                 
+                # Calculate score for selected measure
+                selected_measure = hospital_measures[hospital_measures['Measure Name'].str.contains(health_issue, case=False, na=False)] if health_issue else pd.DataFrame()
+                
+                # Check if we have valid data
+                has_data = not hospital_measures.empty and not all(hospital_measures['Score'] == 'Not Available')
+                
+                # Calculate ratings
+                if has_data:
+                    # Selected measure rating (if available)
+                    measure_score = selected_measure['Score'].iloc[0] if not selected_measure.empty else None
+                    measure_rating = max(1, 6 - (float(measure_score) / 5)) if measure_score and measure_score != 'Not Available' else None
+                    
+                    # Overall rating based on all available measures
+                    all_scores = hospital_measures['Score'][hospital_measures['Score'] != 'Not Available'].astype(float)
+                    overall_rating = max(1, 6 - (all_scores.mean() / 5)) if not all_scores.empty else None
+                    
+                    # Final rating combines both if available
+                    final_rating = measure_rating if measure_rating else overall_rating
+                else:
+                    measure_rating = None
+                    overall_rating = None
+                    final_rating = None
+
                 # Calculate average score
                 hospital_scores = hospital_measures['Score']
                 valid_scores = hospital_scores[hospital_scores != 'Not Available'].astype(float)
@@ -290,26 +291,23 @@ def search_hospitals():
                 latest_measure = hospital_measures.iloc[0] if not hospital_measures.empty else pd.Series()
                 stats = HospitalStats.from_measure(latest_measure)
                 
-                # Calculate performance level based on score
-                if avg_score <= 8:
+                # Calculate performance level based on score (mortality rate)
+                if avg_score <= 5:  # Excellent: mortality rate 0-5%
                     performance = "Excellent"
-                    performance_detail = "significantly better than national average"
-                elif avg_score <= 12:
+                    performance_detail = "significantly lower mortality rate"
+                elif avg_score <= 10:  # Good: mortality rate 5-10%
                     performance = "Good"
-                    performance_detail = "better than national average"
-                elif avg_score <= 16:
+                    performance_detail = "lower mortality rate"
+                elif avg_score <= 15:  # Average: mortality rate 10-15%
                     performance = "Average"
-                    performance_detail = "similar to national average"
-                elif avg_score <= 20:
+                    performance_detail = "average mortality rate"
+                elif avg_score <= 20:  # Below Average: mortality rate 15-20%
                     performance = "Below Average"
-                    performance_detail = "worse than national average"
-                else:
+                    performance_detail = "higher mortality rate"
+                else:  # Poor or No Data: mortality rate >20% or no data
                     performance = "No Rating Available" if avg_score == 25 else "Poor"
-                    performance_detail = "data not available" if avg_score == 25 else "significantly worse than national average"
+                    performance_detail = "data not available" if avg_score == 25 else "significantly higher mortality rate"
 
-                # Calculate overall rating (1-5 scale, inverted from score)
-                overall_rating = 5 - (avg_score / 5) if has_data else None
-                
                 hospital_dict = {
                     "id": str(hospital['Provider ID']),
                     "name": str(hospital['Hospital Name']),
@@ -321,9 +319,9 @@ def search_hospitals():
                     "score": float(avg_score),
                     "hasData": has_data,
                     "ratings": {
-                        "overall": round(overall_rating, 1) if overall_rating is not None else None,
-                        "quality": round(overall_rating * 0.8, 1) if overall_rating is not None else None,
-                        "safety": round(overall_rating * 0.9, 1) if overall_rating is not None else None
+                        "overall": round(final_rating, 1) if final_rating is not None else None,
+                        "quality": round(final_rating * 0.8, 1) if final_rating is not None else None,
+                        "safety": round(final_rating * 0.9, 1) if final_rating is not None else None
                     },
                     "performanceLevel": performance,
                     "description": (
@@ -339,23 +337,42 @@ def search_hospitals():
                     }
                 }
                 
-                results.append(hospital_dict)
-                
+                # Determine location relevance
+                relevance = get_location_relevance(hospital, location)
+                hospital_dict['locationRelevance'] = relevance
+
+                # Add to the unified hospital list
+                hospitals.append(hospital_dict)
+
             except Exception as hospital_error:
                 print(f"Error processing hospital {hospital['Hospital Name']}: {str(hospital_error)}")
                 continue
 
-        if not results:
-            return jsonify([]), 200
+        # Sort hospitals by score and relevance
+        hospitals.sort(key=lambda x: (not x['hasData'], x['score']))
 
-        # Sort results by score only (lower scores are better)
-        results.sort(key=lambda x: (not x['hasData'], x['score']))
-        
-        return jsonify(results), 200
+        # Paginate results
+        def paginate_hospitals(hospitals, page, per_page):
+            start_idx = (page - 1) * per_page
+            end_idx = start_idx + per_page
+            return hospitals[start_idx:end_idx]
+
+        paginated_results = {
+            'hospitals': paginate_hospitals(hospitals, page, per_page),
+            'metadata': {
+                'total': len(hospitals),
+                'currentPage': page,
+                'perPage': per_page,
+                'totalPages': max(math.ceil(len(hospitals) / per_page), 1)
+            }
+        }
+
+        return jsonify(paginated_results), 200
 
     except Exception as e:
         print(f"Error processing hospital search request: {str(e)}")
-        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+        return jsonify({"error": "Internal server error"}), 500
+
 
 
 @app.route('/api/conditions/search', methods=['GET'])
@@ -379,10 +396,6 @@ def search_conditions():
     except Exception as e:
         print(f"Error processing request: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
-
-
-
-
 
 if __name__ == '__main__':
     app.run(debug=True)
