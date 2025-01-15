@@ -1,7 +1,7 @@
 import json
 import requests
 import datetime
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, make_response
 import pandas as pd
 import base64
 from io import BytesIO
@@ -20,31 +20,9 @@ import math
 import numpy as np
 
 app = Flask(__name__)
-# Enable CORS with credentials support
-CORS(app, resources={
-    r"/api/*": {
-        "origins": [
-            "http://localhost:8080",
-            "http://localhost:3000",
-            "http://localhost:5173",
-            # "https://lovable.dev",
-            # "https://gptengineer.app"
-        ],
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"],
-        "supports_credentials": True
-    }
-})
+CORS(app)
 
-# Add CORS headers to all responses
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Credentials', 'true')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    return response
-
-# Load the dataset once when the app starts
+# Load dataset once when app starts
 try:
     dataset = pd.read_csv(r"Hospital inmoratlity.csv")
     # Clean column names and handle missing values
@@ -53,7 +31,7 @@ try:
     # Map the column names from the dataset to the required format
     dataset = dataset.rename(columns={
         'Facility ID': 'Provider ID',
-        'Facility Name': 'Hospital Name', 
+        'Facility Name': 'Hospital Name',
         'Address': 'Address',
         'City/Town': 'City',
         'State': 'State',
@@ -155,18 +133,20 @@ def create_hospital_dict(hospital: pd.Series, avg_score: float, has_data: bool,
         "distance": distance,
         "specialties": []
     }
-
+def filter_hospitals(health_issue: str) -> pd.DataFrame:
+    """Filter hospitals based on health issue"""
+    if not health_issue or dataset.empty:
+        return dataset
+    return dataset[dataset['Measure Name'].str.contains(health_issue, case=False, na=False)]
 def get_location_relevance(hospital: pd.Series, search_location: str) -> str:
-    """Determine if hospital is in the searched city, state, or other location"""
+    """Determine hospital location relevance"""
     try:
-        # Handle cases where location might not contain a comma
         if ',' in search_location:
             search_city, search_state = [x.strip() for x in search_location.split(',', 1)]
         else:
             search_city = search_location.strip()
             search_state = ''
         
-        # Normalize strings for comparison
         hospital_city = str(hospital['City']).strip().upper()
         hospital_state = str(hospital['State']).strip().upper()
         search_city = search_city.upper()
@@ -178,239 +158,57 @@ def get_location_relevance(hospital: pd.Series, search_location: str) -> str:
             return 'state'
         return 'other'
     except Exception as e:
-        print(f"Error processing location relevance for {hospital['Hospital Name']}: {str(e)}")
-        return 'other'  # Default to 'other' if there's an error
+        print(f"Error in location relevance: {str(e)}")
+        return 'other'
 
-@app.route('/api/locations/search', methods=['GET'])
-def search_locations():
-    
-    if dataset.empty:
-        return jsonify({"error": "Dataset not available"}), 500
-
-    query = request.args.get('query', '').strip()
-    field = request.args.get('field', 'City')
-    if not query or len(query) < 2:
-        return jsonify([]), 200
-
-    try:
-        # Map of valid fields to their dataset column names
-        field_mapping = {
-            'City': 'City',
-            'State': 'State',
-            'County': 'County'
-        }
-        
-        if field not in field_mapping:
-            return jsonify({"error": f"Invalid field. Valid fields are: {', '.join(field_mapping.keys())}"}), 400
-            
-        # Get unique values from dataset that match the query
-        column = field_mapping[field]
-        # Convert to string and handle case-insensitive search
-        matching_rows = dataset[dataset[column].astype(str).str.contains(query, case=False, na=False)]
-        
-        # Get unique cities
-        unique_locations = matching_rows.groupby(['City', 'State', 'County', 'ZIP Code']).first().reset_index()
-        
-        # Prepare results
-        # Get unique display strings first
-        display_strings = unique_locations.apply(lambda x: f"{x['City']}, {x['State']}", axis=1).unique()
-        
-        # Create results from unique display strings
-        results = []
-        for i, display_string in enumerate(display_strings[:10]):  # Limit to 10 results
-            city, state = display_string.split(", ")
-            row = unique_locations[
-                (unique_locations['City'] == city) & 
-                (unique_locations['State'] == state)
-            ].iloc[0]
-            
-            results.append({
-                "id": str(i + 1),
-                "city": str(row.get("City", "")),
-                "state": str(row.get("State", "")), 
-                "county": str(row.get("County", "")),
-                "displayString": display_string
-            })
-        return jsonify(results), 200
-        
-    except Exception as e:
-        print(f"Error processing request: {str(e)}")
-        return jsonify({"error": "Internal server error"}), 500
+def create_hospital_dict(hospital: pd.Series, relevance: str) -> dict:
+    """Create hospital dictionary"""
+    return {
+        'id': str(hospital['Provider ID']),
+        'name': str(hospital['Hospital Name']),
+        'address': str(hospital['Address']),
+        'city': str(hospital['City']),
+        'state': str(hospital['State']),
+        'zipCode': str(hospital['ZIP Code']),
+        'county': str(hospital['County']),
+        'score': float(hospital['Score']) if hospital['Score'] != 'Not Available' else 25.0,
+        'hasData': hospital['Score'] != 'Not Available',
+        'locationRelevance': relevance
+    }
 
 @app.route('/api/hospitals/search', methods=['GET'])
 def search_hospitals():
-    # Get pagination parameters
-    page = int(request.args.get('page', 1))
-    per_page = int(request.args.get('per_page', 9))  # 9 cards per page (3x3 grid)
-    
-    if dataset.empty:
-        return jsonify({"error": "Dataset not available"}), 500
-
-    location = request.args.get('location', '').strip()
-    health_issue = request.args.get('healthIssue', '').strip()
-
-    if not location:
-        return jsonify({"error": "Location is required"}), 400
-
     try:
-        # Initialize hospitals list
-        hospitals = []
+        location = request.args.get('location', '').strip()
+        health_issue = request.args.get('healthIssue', '').strip()
+        
+        print(f"Search request - Location: {location}, Issue: {health_issue}")
 
-        # Filter hospitals based on health issue
-        matching_hospitals = dataset.copy()
-        if health_issue:
-            condition_hospitals = matching_hospitals[matching_hospitals['Measure Name'].str.contains(health_issue, case=False, na=False)]
-            if not condition_hospitals.empty:
-                matching_hospitals = condition_hospitals
+        if not location:
+            return jsonify({"error": "Location is required"}), 400
 
-        # Group hospitals
-        hospitals_grouped = matching_hospitals.groupby(
-            ['Provider ID', 'Hospital Name', 'Address', 'City', 'State', 'ZIP Code', 'County']
-        ).first().reset_index()
-            
-        for _, hospital in hospitals_grouped.iterrows():
+        filtered_df = filter_hospitals(health_issue)
+        results = []
+
+        for _, hospital in filtered_df.iterrows():
             try:
-                # Get all measures for this hospital
-                hospital_measures = matching_hospitals[matching_hospitals['Provider ID'] == hospital['Provider ID']]
-                
-                # Calculate score for selected measure
-                selected_measure = hospital_measures[hospital_measures['Measure Name'].str.contains(health_issue, case=False, na=False)] if health_issue else pd.DataFrame()
-                
-                # Check if we have valid data
-                has_data = not hospital_measures.empty and not all(hospital_measures['Score'] == 'Not Available')
-                
-                # Calculate ratings
-                if has_data:
-                    # Selected measure rating (if available)
-                    measure_score = selected_measure['Score'].iloc[0] if not selected_measure.empty else None
-                    measure_rating = max(1, 6 - (float(measure_score) / 5)) if measure_score and measure_score != 'Not Available' else None
-                    
-                    # Overall rating based on all available measures
-                    all_scores = hospital_measures['Score'][hospital_measures['Score'] != 'Not Available'].astype(float)
-                    overall_rating = max(1, 6 - (all_scores.mean() / 5)) if not all_scores.empty else None
-                    
-                    # Final rating combines both if available
-                    final_rating = measure_rating if measure_rating else overall_rating
-                else:
-                    measure_rating = None
-                    overall_rating = None
-                    final_rating = None
-
-                # Calculate average score
-                hospital_scores = hospital_measures['Score']
-                valid_scores = hospital_scores[hospital_scores != 'Not Available'].astype(float)
-                avg_score = valid_scores.mean() if not valid_scores.empty else 25
-                has_data = not valid_scores.empty
-                
-                # Get statistics from latest measure
-                latest_measure = hospital_measures.iloc[0] if not hospital_measures.empty else pd.Series()
-                stats = HospitalStats.from_measure(latest_measure)
-                
-                # Calculate performance level based on score (mortality rate)
-                if avg_score <= 5:  # Excellent: mortality rate 0-5%
-                    performance = "Excellent"
-                    performance_detail = "significantly lower mortality rate"
-                elif avg_score <= 10:  # Good: mortality rate 5-10%
-                    performance = "Good"
-                    performance_detail = "lower mortality rate"
-                elif avg_score <= 15:  # Average: mortality rate 10-15%
-                    performance = "Average"
-                    performance_detail = "average mortality rate"
-                elif avg_score <= 20:  # Below Average: mortality rate 15-20%
-                    performance = "Below Average"
-                    performance_detail = "higher mortality rate"
-                else:  # Poor or No Data: mortality rate >20% or no data
-                    performance = "No Rating Available" if avg_score == 25 else "Poor"
-                    performance_detail = "data not available" if avg_score == 25 else "significantly higher mortality rate"
-
-                hospital_dict = {
-                    "id": str(hospital['Provider ID']),
-                    "name": str(hospital['Hospital Name']),
-                    "address": str(hospital['Address']),
-                    "city": str(hospital['City']),
-                    "state": str(hospital['State']),
-                    "zipCode": str(hospital['ZIP Code']),
-                    "county": str(hospital['County']),
-                    "score": float(avg_score),
-                    "hasData": has_data,
-                    "ratings": {
-                        "overall": round(final_rating, 1) if final_rating is not None else None,
-                        "quality": round(final_rating * 0.8, 1) if final_rating is not None else None,
-                        "safety": round(final_rating * 0.9, 1) if final_rating is not None else None
-                    },
-                    "performanceLevel": performance,
-                    "description": (
-                        f"Hospital in {hospital['City']}, {hospital['State']} - "
-                        f"Performance is {performance_detail}. "
-                        f"{stats.format_comment()}"
-                    ),
-                    "statistics": {
-                        "denominator": stats.denominator,
-                        "lowerEstimate": stats.lower_estimate,
-                        "higherEstimate": stats.higher_estimate,
-                        "measureName": stats.measure_name
-                    }
-                }
-                
-                # Determine location relevance
                 relevance = get_location_relevance(hospital, location)
-                hospital_dict['locationRelevance'] = relevance
-
-                # Add to the unified hospital list
-                hospitals.append(hospital_dict)
-
-            except Exception as hospital_error:
-                print(f"Error processing hospital {hospital['Hospital Name']}: {str(hospital_error)}")
+                hospital_dict = create_hospital_dict(hospital, relevance)
+                results.append(hospital_dict)
+            except Exception as e:
+                print(f"Error processing hospital: {str(e)}")
                 continue
 
-        # Sort hospitals by score and relevance
-        hospitals.sort(key=lambda x: (not x['hasData'], x['score']))
-
-        # Paginate results
-        def paginate_hospitals(hospitals, page, per_page):
-            start_idx = (page - 1) * per_page
-            end_idx = start_idx + per_page
-            return hospitals[start_idx:end_idx]
-
-        paginated_results = {
-            'hospitals': paginate_hospitals(hospitals, page, per_page),
+        return jsonify({
+            'hospitals': results,
             'metadata': {
-                'total': len(hospitals),
-                'currentPage': page,
-                'perPage': per_page,
-                'totalPages': max(math.ceil(len(hospitals) / per_page), 1)
+                'total': len(results)
             }
-        }
-
-        return jsonify(paginated_results), 200
+        })
 
     except Exception as e:
-        print(f"Error processing hospital search request: {str(e)}")
-        return jsonify({"error": "Internal server error"}), 500
-
-
-
-@app.route('/api/conditions/search', methods=['GET'])
-def search_conditions():
-    if dataset.empty:
-        return jsonify({"error": "Dataset not available"}), 500
-
-    query = request.args.get('query', '').strip()
-    if not query or len(query) < 2:
-        return jsonify([]), 200
-
-    try:
-        # Filter the dataset to match health conditions (Measure Name in your case)
-        matching_rows = dataset[dataset['Measure Name'].str.contains(query, case=False, na=False)]
-
-        # Prepare the results
-        results = matching_rows['Measure Name'].unique()
-        
-        return jsonify(results.tolist()), 200
-
-    except Exception as e:
-        print(f"Error processing request: {str(e)}")
-        return jsonify({"error": "Internal server error"}), 500
+        print(f"Server Error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
