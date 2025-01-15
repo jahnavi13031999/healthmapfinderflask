@@ -158,13 +158,28 @@ def create_hospital_dict(hospital: pd.Series, avg_score: float, has_data: bool,
 
 def get_location_relevance(hospital: pd.Series, search_location: str) -> str:
     """Determine if hospital is in the searched city, state, or other location"""
-    search_city, search_state = [x.strip() for x in search_location.split(',', 1)]
-    
-    if hospital['City'].strip().upper() == search_city.upper():
-        return 'city'
-    elif hospital['State'].strip().upper() == search_state.strip().upper():
-        return 'state'
-    return 'other'
+    try:
+        # Handle cases where location might not contain a comma
+        if ',' in search_location:
+            search_city, search_state = [x.strip() for x in search_location.split(',', 1)]
+        else:
+            search_city = search_location.strip()
+            search_state = ''
+        
+        # Normalize strings for comparison
+        hospital_city = str(hospital['City']).strip().upper()
+        hospital_state = str(hospital['State']).strip().upper()
+        search_city = search_city.upper()
+        search_state = search_state.upper()
+        
+        if hospital_city == search_city:
+            return 'city'
+        elif hospital_state == search_state:
+            return 'state'
+        return 'other'
+    except Exception as e:
+        print(f"Error processing location relevance for {hospital['Hospital Name']}: {str(e)}")
+        return 'other'  # Default to 'other' if there's an error
 
 @app.route('/api/locations/search', methods=['GET'])
 def search_locations():
